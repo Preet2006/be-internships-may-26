@@ -284,26 +284,3 @@ horizontal scaling, observability, and failure handling.
 | `429`  | Per-user rate limit exceeded                                 |
 | `503`  | Database remained unavailable after retries                  |
 
-## Git workflow
-
-The completed implementation is maintained on the `assignment-solution`
-branch. The repository's `main` branch remains at the original assignment
-commit.
-
-To switch to the implementation branch:
-
-```powershell
-git switch assignment-solution
-```
-
-To verify the branch:
-
-```powershell
-git branch --show-current
-```
-
-The expected output is:
-
-```text
-assignment-solution
-```
