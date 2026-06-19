@@ -1,38 +1,77 @@
-import test from 'node:test';
-import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { setTimeout as wait } from 'node:timers/promises';
-import http from 'node:http';
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import {
+  postSignal,
+  startServer,
+  stopServer,
+  waitForServer,
+} from "./helpers.js";
 
-test('idempotency returns same resource for same key', async () => {
-  const proc = spawn('node', ['src/server.js'], { env: { ...process.env, API_KEY: 'k', PORT: '9091' } });
-  await wait(300);
-
-  const base = 'http://localhost:9091';
-  const idem = 'same-key';
-
-  const a = await postJson(`${base}/v1/signals`, {
-    headers: { 'x-api-key': 'k', 'Idempotency-Key': idem },
-    body: { userId: 'u1', type: 'note', payload: 'x' }
+test("parallel requests with one idempotency key return one resource", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "signals-idem-"));
+  const databaseUrl = path.join(directory, "signals.db");
+  const server = startServer({
+    port: 9091,
+    databaseUrl,
+    env: { RATE_LIMIT_PER_MIN: "100" },
   });
-  const b = await postJson(`${base}/v1/signals`, {
-    headers: { 'x-api-key': 'k', 'Idempotency-Key': idem },
-    body: { userId: 'u1', type: 'note', payload: 'x' }
-  });
 
-  assert.equal(a.id, b.id);
-  assert.equal(a.idempotencyKey, b.idempotencyKey);
-  proc.kill();
+  t.after(async () => {
+    await stopServer(server);
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  await waitForServer(9091, server);
+
+  const responses = await Promise.all(
+    Array.from({ length: 20 }, () =>
+      postSignal(
+        9091,
+        { userId: "u1", type: "note", payload: "x" },
+        "same-key",
+      ),
+    ),
+  );
+
+  assert.ok(responses.every(({ statusCode }) => statusCode === 200));
+  assert.equal(new Set(responses.map(({ body }) => body.id)).size, 1);
+  assert.ok(
+    responses.every(
+      ({ body }) => body.idempotencyKey === "same-key" && body.payload === "x",
+    ),
+  );
 });
 
-async function postJson(url, { headers, body }){
-  return new Promise((resolve, reject) => {
-    const data = JSON.stringify(body);
-    const req = http.request(url, { method: 'POST', headers: { 'content-type': 'application/json', ...headers } }, (res) => {
-      let chunks=''; res.on('data', d => chunks+=d);
-      res.on('end', () => resolve(JSON.parse(chunks||'{}')));
-    });
-    req.on('error', reject);
-    req.write(data); req.end();
+test("idempotency survives a restart", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "signals-restart-"));
+  const databaseUrl = path.join(directory, "signals.db");
+  const first = startServer({ port: 9093, databaseUrl });
+  let second;
+
+  t.after(async () => {
+    await stopServer(first);
+    if (second) await stopServer(second);
+    fs.rmSync(directory, { recursive: true, force: true });
   });
-}
+
+  await waitForServer(9093, first);
+  const created = await postSignal(
+    9093,
+    { userId: "u1", type: "note", payload: "persistent" },
+    "restart-key",
+  );
+  await stopServer(first);
+
+  second = startServer({ port: 9093, databaseUrl });
+  await waitForServer(9093, second);
+  const replayed = await postSignal(
+    9093,
+    { userId: "u1", type: "note", payload: "persistent" },
+    "restart-key",
+  );
+
+  assert.equal(replayed.statusCode, 200);
+  assert.equal(replayed.body.id, created.body.id);
+});
