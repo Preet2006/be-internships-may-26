@@ -1,34 +1,97 @@
-# Signals Challenge (Node.js + Fastify)
+# Signals Service
 
-Build a minimal production-leaning service that can **handle load**, **rate limit**, and **avoid duplicates** via idempotency.
+A production-leaning Fastify service that accepts user signals, enforces a
+shared per-user rate limit, and provides atomic idempotency.
 
-## Endpoints (to keep)
-- `POST /v1/signals`
-  - body: `{ "userId": "string", "type": "string", "payload": "string" }`
-  - headers: `X-API-Key`, `Idempotency-Key` (optional)
-  - behaviors:
-    - **Rate limit** per `userId`: `RATE_LIMIT_PER_MIN` per minute (default 5).
-    - **Idempotency**: same `Idempotency-Key` should not create duplicates.
-- `GET /v1/signals?userId=...&limit=...`
-- `GET /healthz`
+## Run locally
 
-## Your Tasks
-1. **Implement a robust rate limiter** in `src/rateLimit.js`.
-2. **Make idempotency safe across scale** in `src/signals.js`.
-3. **Handle DB failure** gracefully with retry/backoff.
-4. **Think for 10k RPS.** Add a `SCALE.md`.
-5. **Finish the tests** in `tests/*.test.js`.
+Requires Node.js 20 or newer.
 
-## Deliverables
-- Working service, passing tests, updated README, SCALE.md.
-- Optional deploy link.
----
+```bash
+npm install
+copy .env.example .env
+npm run dev
+```
 
-## Extra Production Constraints (must pass)
+The service listens on `http://localhost:8080` by default.
 
-- **Atomic Idempotency:** Survive concurrent requests and restarts. Avoid check-then-insert races; use a DB-level unique constraint or atomic upsert pattern. Return the same resource for identical `Idempotency-Key`.
-- **Concurrency-Safe Rate Limit:** Must behave correctly under burst and parallel calls. Naive in-memory counters that race will fail hidden checks. Explain how this becomes multi-instance safe.
-- **Transient DB Failures:** Implement retry/backoff (with jitter) or circuit breaker when DB errors occur (we simulate via `DB_FAIL_RATE`). No duplicates on retry.
-- **Scale Plan (10k RPS):** Fill `SCALE.md` with a clear, concise approach (indexes, pooling, caching, queues, horizontal scale, idempotency store).
+## Configuration
 
-> We will run additional **hidden concurrency/multi-instance tests** during evaluation.
+| Variable             |             Default | Purpose                                         |
+| -------------------- | ------------------: | ----------------------------------------------- |
+| `API_KEY`            |         `change-me` | Required `X-API-Key` value                      |
+| `PORT`               |              `8080` | HTTP listen port                                |
+| `DATABASE_URL`       | `./data/signals.db` | SQLite database path                            |
+| `RATE_LIMIT_PER_MIN` |                 `5` | Accepted creates per user per fixed minute      |
+| `DB_FAIL_RATE`       |                 `0` | Probability of a simulated transient DB failure |
+| `DB_RETRY_ATTEMPTS`  |                 `4` | Maximum attempts for transient DB operations    |
+| `DB_RETRY_BASE_MS`   |                `15` | Initial exponential-backoff delay               |
+
+Do not use the example API key in a deployed environment.
+
+## API
+
+All `/v1` routes require `X-API-Key`.
+
+### Create a signal
+
+```http
+POST /v1/signals
+X-API-Key: change-me
+Idempotency-Key: optional-client-key
+Content-Type: application/json
+
+{
+  "userId": "user-123",
+  "type": "note",
+  "payload": "hello"
+}
+```
+
+`userId` and `type` must be non-empty strings. `payload` is stored as a
+string. An idempotency key may be at most 255 characters.
+
+- Reusing a key returns the originally created resource, including after a
+  restart.
+- Replays do not consume additional rate-limit capacity.
+- A rejected create returns `429`, `Retry-After`, `remaining`, and `resetMs`.
+- Exhausted transient database retries return `503`.
+
+### List signals
+
+```http
+GET /v1/signals?userId=user-123&limit=20
+X-API-Key: change-me
+```
+
+`limit` must be a positive integer and is capped at 100.
+
+### Health
+
+```http
+GET /healthz
+```
+
+Returns `{ "ok": true }` and does not require authentication.
+
+## Concurrency design
+
+The create path runs in one `BEGIN IMMEDIATE` SQLite transaction:
+
+1. Return an existing idempotent resource, if present.
+2. Atomically upsert the shared `(user_id, window_start)` rate-limit counter.
+3. Insert with a database-level unique idempotency constraint.
+
+WAL mode and a busy timeout allow multiple local processes to coordinate on
+the same database. Transient lock/failure errors retry the complete
+transaction with bounded exponential backoff and jitter. See [SCALE.md](SCALE.md)
+for the 10k RPS production architecture.
+
+## Tests
+
+```bash
+npm test
+```
+
+The suite covers parallel idempotent creates, restart persistence, burst
+limiting, and rate-limit sharing across two server instances.

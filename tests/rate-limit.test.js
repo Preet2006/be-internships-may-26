@@ -1,36 +1,93 @@
-import test from 'node:test';
-import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { setTimeout as wait } from 'node:timers/promises';
-import http from 'node:http';
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import {
+  postSignal,
+  startServer,
+  stopServer,
+  waitForServer,
+} from "./helpers.js";
 
-test('rate limit: allow 5 per minute, 6th is 429', async () => {
-  const proc = spawn('node', ['src/server.js'], { env: { ...process.env, API_KEY: 'k', PORT: '9092', RATE_LIMIT_PER_MIN: '5' } });
-  await wait(300);
+test("parallel burst atomically allows five requests", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "signals-rate-"));
+  const databaseUrl = path.join(directory, "signals.db");
+  const server = startServer({
+    port: 9092,
+    databaseUrl,
+    env: { RATE_LIMIT_PER_MIN: "5" },
+  });
 
-  const base = 'http://localhost:9092';
-  const statuses = [];
-  for (let i=0;i<6;i++){
-    const code = await postStatus(`${base}/v1/signals`, {
-      headers: { 'x-api-key': 'k' },
-      body: { userId: 'u1', type: 'note', payload: String(i) }
-    });
-    statuses.push(code);
-  }
-  const counts = statuses.reduce((acc,c)=> (acc[c]=(acc[c]||0)+1, acc), {});
-  assert.ok(counts[200] >= 5);
-  assert.ok(counts[429] >= 1);
-  proc.kill();
+  t.after(async () => {
+    await stopServer(server);
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  await waitForServer(9092, server);
+
+  const responses = await Promise.all(
+    Array.from({ length: 20 }, (_, index) =>
+      postSignal(9092, {
+        userId: "burst-user",
+        type: "note",
+        payload: String(index),
+      }),
+    ),
+  );
+
+  assert.equal(
+    responses.filter(({ statusCode }) => statusCode === 200).length,
+    5,
+  );
+  assert.equal(
+    responses.filter(({ statusCode }) => statusCode === 429).length,
+    15,
+  );
+  assert.ok(
+    responses
+      .filter(({ statusCode }) => statusCode === 429)
+      .every(({ headers }) => Number(headers["retry-after"]) >= 1),
+  );
 });
 
-async function postStatus(url, { headers, body }){
-  return new Promise((resolve, reject) => {
-    const data = JSON.stringify(body);
-    const req = http.request(url, { method: 'POST', headers: { 'content-type': 'application/json', ...headers } }, (res) => {
-      res.resume();
-      res.on('end', () => resolve(res.statusCode));
-    });
-    req.on('error', reject);
-    req.write(data); req.end();
+test("rate limit is shared by two server instances", async (t) => {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "signals-multi-instance-"),
+  );
+  const databaseUrl = path.join(directory, "signals.db");
+  const first = startServer({
+    port: 9094,
+    databaseUrl,
+    env: { RATE_LIMIT_PER_MIN: "5" },
   });
-}
+  const second = startServer({
+    port: 9095,
+    databaseUrl,
+    env: { RATE_LIMIT_PER_MIN: "5" },
+  });
+
+  t.after(async () => {
+    await Promise.all([stopServer(first), stopServer(second)]);
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  await Promise.all([waitForServer(9094, first), waitForServer(9095, second)]);
+
+  const responses = await Promise.all(
+    Array.from({ length: 12 }, (_, index) =>
+      postSignal(index % 2 === 0 ? 9094 : 9095, {
+        userId: "shared-user",
+        type: "note",
+        payload: String(index),
+      }),
+    ),
+  );
+
+  assert.equal(
+    responses.filter(({ statusCode }) => statusCode === 200).length,
+    5,
+  );
+  assert.equal(
+    responses.filter(({ statusCode }) => statusCode === 429).length,
+    7,
+  );
+});

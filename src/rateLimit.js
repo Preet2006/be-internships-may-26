@@ -1,18 +1,41 @@
-const RATE = Number(process.env.RATE_LIMIT_PER_MIN || 5);
-const WINDOW_MS = 60_000;
-const buckets = new Map();
+import { getDatabase } from "./db.js";
 
-export function checkAndConsume(userId, nowMs = Date.now()) {
-  const wStart = nowMs - WINDOW_MS;
-  const ent = buckets.get(userId) || { ts: nowMs, cnt: 0 };
-  if (ent.ts < wStart) {
-    ent.ts = nowMs;
-    ent.cnt = 0;
+export const WINDOW_MS = 60_000;
+
+const statements = new WeakMap();
+
+function getStatements(db) {
+  let cached = statements.get(db);
+  if (!cached) {
+    cached = {
+      consume: db.prepare(`
+        INSERT INTO rate_limits (user_id, window_start, request_count)
+        VALUES (?, ?, 1)
+        ON CONFLICT(user_id, window_start) DO UPDATE SET
+          request_count = request_count + 1
+        RETURNING request_count
+      `),
+    };
+    statements.set(db, cached);
   }
-  ent.cnt += 1;
-  buckets.set(userId, ent);
-  const ok = ent.cnt <= RATE;
-  const resetMs = ent.ts + WINDOW_MS;
-  const remaining = Math.max(RATE - ent.cnt, 0);
-  return { ok, remaining, resetMs };
+  return cached;
+}
+
+export function checkAndConsume(
+  userId,
+  nowMs = Date.now(),
+  connection = getDatabase(),
+) {
+  const rate = Math.max(1, Number(process.env.RATE_LIMIT_PER_MIN || 5));
+  const windowStart = Math.floor(nowMs / WINDOW_MS) * WINDOW_MS;
+  const { request_count: count } = getStatements(connection).consume.get(
+    userId,
+    windowStart,
+  );
+
+  return {
+    ok: count <= rate,
+    remaining: Math.max(rate - count, 0),
+    resetMs: windowStart + WINDOW_MS,
+  };
 }

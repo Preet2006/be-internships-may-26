@@ -1,0 +1,7 @@
+node_modules/
+.env
+data/*.db-shm
+data/*.db-wal
+npm-debug.log*
+server.stdout.log
+server.stderr.log
